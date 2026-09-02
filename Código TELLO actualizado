@@ -1,0 +1,239 @@
+# ==============================================================================
+# IMPORTACIÓN DE LIBRERÍAS
+# ==============================================================================
+import threading        # Permite ejecutar tareas en paralelo (hilo secundario para el mando)
+import pygame           # Captura de entradas e interacción con el joystick de Xbox
+import pygame.locals
+import cv2              # OpenCV: Procesamiento, formateo y renderizado de video
+import numpy as np      # Operaciones matriciales para manipular las imágenes
+import tellopy          # Control del dron DJI Tello mediante comandos de red
+import av               # PyAV: Decodificación directa del flujo de video H.264
+import time             # Gestión de temporización y pausado de hilos
+import sys              # Finalización limpia del script del sistema
+from ultralytics import YOLO  # Framework de visión artificial YOLOv8
+
+# Nombre/ruta del modelo YOLO preentrenado (versión nano para optimizar velocidad)
+MODEL_NAME = 'yolov8n.pt'
+
+# ==============================================================================
+# CONFIGURACIÓN Y MAPEO DEL CONTROLADOR (JOYSTICK XBOX)
+# ==============================================================================
+class JoystickXONE:
+    """Mapeo numérico de botones y ejes para controles Xbox One / Series."""
+    # Cruceta / D-Pad
+    UP = 0
+    DOWN = 1
+    ROTATE_LEFT = 2
+    ROTATE_RIGHT = 3
+
+    # Gatillos superiores / Bumpers
+    TAKEOFF = 9  # RB: Despegar
+    LAND = 8     # LB: Aterrizar
+
+    # Botones principales
+    FORWARD = 14   # Y: Avanzar
+    BACKWARD = 11  # A: Retroceder
+    LEFT = 13      # X: Izquierda
+    RIGHT = 12     # B: Derecha
+
+    DEADZONE = 0.09  # Umbral de zona muerta para evitar lecturas no deseadas
+
+class JoystickState:
+    """Estructura para almacenar y compartir el estado del mando entre hilos."""
+    def __init__(self):
+        self.type = None    # Tipo de evento (Botón presionado, eje movido, etc.)
+        self.button = None  # ID del botón presionado
+        self.value = None   # Valor o posición del eje/botón
+        self.axis = None    # Índice del eje analógico
+
+def joystick_thread(state):
+    """
+    Hilo Secundario: Escucha el control de Xbox continuamente en segundo plano 
+    para no congelar ni pausar el procesamiento de video del hilo principal.
+    """
+    pygame.init()
+    pygame.joystick.init()
+
+    # Intentar inicializar el primer mando detectado
+    try:
+        js = pygame.joystick.Joystick(0)
+        js.init()
+        print('Joystick conectado: ' + js.get_name())
+    except pygame.error:
+        print('No se encontro ningun joystick (Puedes usar el teclado)')
+
+    # Bucle infinito que lee los eventos del mando
+    try:
+        while True:
+            time.sleep(0.01)  # Descanso de 10ms para evitar consumo excesivo de CPU
+            for e in pygame.event.get():
+                # Movimiento de la cruceta (D-pad)
+                if e.type == pygame.locals.JOYHATMOTION:
+                    state.type = e.type
+                    state.value = e.value
+                    state.button = None
+                # Botón presionado o soltado
+                elif e.type in (pygame.locals.JOYBUTTONDOWN, pygame.locals.JOYBUTTONUP):
+                    state.type = e.type
+                    state.value = None
+                    state.button = e.button
+                # Movimiento de palancas analógicas
+                elif e.type == pygame.locals.JOYAXISMOTION:
+                    state.type = e.type
+                    state.value = e.value
+                    state.axis = e.axis
+    except Exception as e:
+        print(f"Error en joystick: {e}")
+
+# ==============================================================================
+# HILO PRINCIPAL: PROCESAMIENTO DE IA Y CONTROL DE VUELO
+# ==============================================================================
+def main():
+    """Hilo Principal: Conexión al dron, procesamiento YOLO, interfaz y control."""
+    print("Iniciando modelo YOLO...")
+    model = YOLO(MODEL_NAME)  # Cargar red neuronal YOLO en memoria
+
+    print("Conectando al dron...")
+    drone = tellopy.Tello()
+    drone.connect()
+    drone.wait_for_connection(60.0)  # Establecer comunicación UDP con el Tello
+    print("Dron conectado. Abriendo stream de video...")
+
+    # PyAV abre y decodifica el flujo de video RTSP emitido por el dron
+    container = av.open(drone.get_video_stream())
+
+    # --- PARÁMETROS DE VUELO Y CONTROL PROPORCIONAL (P) ---
+    modo_ia = False       # Interruptor del seguimiento automático por IA
+    speed = 50            # Velocidad estándar para control manual (0-100)
+    K_YAW = 0.15          # Ganancia de corrección para rotación (Giro sobre eje Z)
+    K_PITCH = 0.2         # Ganancia de corrección para avance/retroceso
+    K_THROTTLE = 0.15     # Ganancia de corrección para altitud (Arriba/Abajo)
+    TARGET_AREA = 40000   # Área objetivo (px²) para mantener distancia con la persona
+
+    # --- OPTIMIZACIÓN DE FLUJO DE VIDEO ---
+    frame_skip = 3        # Procesa 1 de cada 3 cuadros para mitigar el acumulado de latencia
+    frame_count = 0
+
+    # Inicializar el estado del mando y lanzar su hilo independiente
+    state = JoystickState()
+    j_thread = threading.Thread(target=joystick_thread, args=(state,), daemon=True)
+    j_thread.start()
+
+    print("--- SISTEMA LISTO ---")
+    print("Presiona 'M' en el teclado de tu PC para activar/desactivar la IA.")
+    print("Presiona 'T' para despegar, 'Y' para aterrizar, Espacio para frenar.")
+    print("Presiona 'Q' para salir de forma segura.")
+
+    # Bucle cuadro a cuadro procesando el video entrante
+    for frame in container.decode(video=0):
+        frame_count += 1
+        
+        # Saltar cuadros para evitar que la transmisión de video se congele o lleve retraso
+        if frame_count % frame_skip != 0:
+            continue
+
+        # Convertir fotograma PyAV (RGB) a formato compatible con OpenCV (BGR)
+        image_np = cv2.cvtColor(np.array(frame.to_image()), cv2.COLOR_RGB2BGR)
+        height, width, _ = image_np.shape
+        center_x_frame = width // 2   # Coordenada X del centro de la imagen
+        center_y_frame = height // 2  # Coordenada Y del centro de la imagen
+
+        # Ejecución de la IA (Inferencia reducida a 320px para máxima velocidad en FPS)
+        results = model.predict(image_np, conf=0.5, verbose=False, imgsz=320)
+        
+        yaw_speed = pitch_speed = throttle_speed = 0
+        object_detected = False
+
+        # --- SECCIÓN 1: LECTURA DE MANDO XBOX (PRIORIDAD MANUAL) ---
+        if state.type == pygame.locals.JOYBUTTONDOWN:
+            if state.button == JoystickXONE.TAKEOFF: drone.takeoff()
+            elif state.button == JoystickXONE.LAND: drone.land()
+            elif state.button == JoystickXONE.FORWARD: drone.forward(speed)
+            elif state.button == JoystickXONE.BACKWARD: drone.backward(speed)
+            elif state.button == JoystickXONE.LEFT: drone.left(speed)
+            elif state.button == JoystickXONE.RIGHT: drone.right(speed)
+        
+        elif state.type == pygame.locals.JOYBUTTONUP:
+            # Detener desplazamientos cuando se suelta un botón
+            drone.forward(0); drone.backward(0); drone.left(0); drone.right(0)
+            state.type = None  # Limpiar estado del evento para evitar repeticiones repetitivas
+
+        # --- SECCIÓN 2: RASTREO Y AUTOPILOTO (MODO IA) ---
+        else:
+            for r in results:
+                boxes = r.boxes
+                for box in boxes:
+                    x, y, w, h = box.xywh[0]
+                    cls = int(box.cls[0])
+                    
+                    if cls == 0:  # La clase 0 en el dataset COCO representa "Persona"
+                        object_detected = True
+                        
+                        # Error Horizontal -> Cálculo de velocidad para girar hacia la persona (Yaw)
+                        error_x = x.item() - center_x_frame
+                        yaw_speed = max(-100, min(100, int(error_x * K_YAW)))
+                        
+                        # Error Vertical -> Cálculo de velocidad de altura (Throttle)
+                        error_y = y.item() - center_y_frame
+                        throttle_speed = max(-100, min(100, int(error_y * K_THROTTLE)))
+                        
+                        # Error de Distancia -> Cálculo según el tamaño de la persona en pantalla (Pitch)
+                        area = w.item() * h.item()
+                        error_area = TARGET_AREA - area
+                        pitch_speed = max(-100, min(100, int(error_area * 0.001 * K_PITCH)))
+
+                        # Dibujar interfaz visual (Cuadro delimitador verde y punto central rojo)
+                        cv2.rectangle(image_np, (int(x-w/2), int(y-h/2)), (int(x+w/2), int(y+h/2)), (0, 255, 0), 2)
+                        cv2.circle(image_np, (int(x), int(y)), 5, (0, 0, 255), -1)
+                        break  # Enfocar únicamente a una persona a la vez
+
+            # Aplicar comandos de vuelo calculados si la IA está encendida y hay un objetivo
+            if modo_ia and object_detected: 
+                # Eje Z (Rotación / Guiñada)
+                if yaw_speed > 20: drone.clockwise(abs(yaw_speed))
+                elif yaw_speed < -20: drone.counter_clockwise(abs(yaw_speed))
+                else: drone.clockwise(0)
+
+                # Eje X (Avanzar / Retroceder)
+                if pitch_speed > 20: drone.forward(abs(pitch_speed))
+                elif pitch_speed < -20: drone.backward(abs(pitch_speed))
+                else: drone.forward(0)
+                
+                # Eje Y (Subir / Bajar)
+                if throttle_speed < -20: drone.up(abs(throttle_speed))
+                elif throttle_speed > 20: drone.down(abs(throttle_speed))
+                else: drone.up(0)
+            else:
+                # Si no detecta a nadie o el modo IA está apagado, mantiene el vuelo estacionario
+                drone.clockwise(0); drone.forward(0); drone.up(0) 
+
+        # --- SECCIÓN 3: MOSTRAR VIDEO EN PANTALLA ---
+        cv2.imshow('YOLO Tello', image_np)
+        
+        # --- SECCIÓN 4: TECLADO DE LA PC (TECLAS DE CONTROL MANUAL Y EMERGENCIAS) ---
+        key = cv2.waitKey(1) & 0xFF
+        if key != 255:  
+            if key == ord('q'):
+                break  # Terminar bucle y apagar de forma segura
+            elif key == ord('m'):
+                modo_ia = not modo_ia
+                print(">>> IA Activada" if modo_ia else ">>> IA Apagada: Tomando control manual")
+                drone.forward(0); drone.left(0); drone.up(0); drone.clockwise(0)
+            elif key == ord('t'): drone.takeoff()   # Tecla T: Despegar
+            elif key == ord('y'): drone.land()      # Tecla Y: Aterrizar
+            elif key == ord(' '):                   # Barra Espaciadora: Frenado inmediato de emergencia
+                drone.forward(0); drone.backward(0); drone.left(0); drone.right(0)
+                drone.up(0); drone.down(0); drone.clockwise(0); drone.counter_clockwise(0)
+            elif key == ord('w'): drone.forward(speed)   # W: Avanzar
+            elif key == ord('s'): drone.backward(speed)  # S: Retroceder
+            elif key == ord('a'): drone.left(speed)      # A: Izquierda
+            elif key == ord('d'): drone.right(speed)     # D: Derecha
+
+    # --- SECUENCIA DE APAGADO SEGURO ---
+    print("Cerrando conexion...")
+    drone.quit()
+    cv2.destroyAllWindows()
+    sys.exit()
+
+if __name__ == '__main__':
+    main()
